@@ -250,3 +250,217 @@ Beyond the metric algebra above, the engine closes off the everyday mistakes tha
 Time ranges are unambiguous. A range like Jan 2024 means [2024-01-01, 2025-01-01) — start included, end excluded — so days never get double-counted at month boundaries.
 Errors tell you how to fix them. A wrong metric name doesn't get a stack trace; it gets a message naming the closest valid options. In --format json, every error carries a stable code and suggested fix, so automated tools (and AI agents) can self-correct.
 These guarantees are written down precisely — as a normative contract — in the semantics reference. You don't need to read it to use Dosi, but it's there when you want to know exactly what the engine promises.
+
+Skip to content
+Dosi
+Grain: what one row means
+
+
+
+ 
+Dosi
+Home
+Get started
+Get started
+Quickstart
+What is Apache Ossie & Why Dosi
+Grain: what one row means
+Table of contents
+The example
+Four grains in one query
+The rule: aggregate from fine to coarse
+Two facts in one answer: align, don't join rows
+A metric at its own grain: LOD
+LOD and alignment together
+Reading grain errors
+Where to next
+How metrics compose
+Install manually
+Tutorial: the dosi CLI
+Guides
+Guides
+Dosi in agents
+Dosi in agents
+The Dosi plugin
+The Dosi plugin
+The Dosi plugin
+Claude Code
+Codex
+DeepSeek Harness
+Other agents
+Run the MCP server yourself
+Connect a warehouse
+Connect a warehouse
+DuckDB
+SQLite
+MySQL
+TiDB
+StarRocks
+Doris
+PostgreSQL
+Oracle
+SAP HANA
+ClickHouse
+Trino
+Amazon Athena
+Snowflake
+Redshift
+BigQuery
+Databricks
+Query metrics
+Query detail rows
+Metric attribution
+Metric lineage
+Ontologies
+Fast result transfer (Arrow)
+Extensions
+Extensions
+Overview
+Window metrics
+LOD
+LOD
+Understand and start using LOD
+Commerce modeling walkthrough
+Authoring reference
+Parameterized metrics
+Derived metrics
+Cross-fact alignment
+Time storage format
+Versions & compatibility
+Reference
+Reference
+CLI
+SQL policy providers
+REST API
+MCP server
+Errors
+Python API
+Semantics contract
+Benchmarks
+Release notes
+Grain: what one row means¶
+Every number Dosi returns was computed at some grain, the answer to the question what does one row mean here? One row of orders is one order. One row of a result grouped by region is one region. Most wrong metric numbers come from getting this wrong without noticing: a join that quietly turns one customer into three rows, or an average taken over orders when the question was about customers.
+
+This page names the four grains in a query, gives the one rule Dosi enforces between them, and shows the two ways to bring more than one grain into an answer: aligning two fact tables, and letting a metric compute at its own grain with LOD.
+
+The example¶
+Three small tables. Every result below was run against them.
+
+customers	region	sales_target
+C1	East	500
+C2	East	300
+C3	West	600
+orders	customer	order_date	amount
+O1	C1	2024-01-05	100
+O2	C1	2024-01-20	300
+O3	C2	2024-01-12	200
+O4	C3	2024-02-03	400
+visits holds eight site visits: five in January and three in February. Each order and each visit belongs to one customer, so both relate many-to-one to customers.
+
+Four grains in one query¶
+Take revenue (SUM(orders.amount)) by region:
+
+
+dosi query --model model.yaml --metrics revenue,order_count \
+    --group-by customers.region --execute --db shop.duckdb
+region  revenue  order_count
+East    600      3
+West    400      1
+2 rows
+Four grains are at work in that query:
+
+Grain	What one row means here	Set by
+Row grain	orders: one order. customers: one customer.	The dataset's primary_key
+Calculation grain	Each order's amount enters the SUM once.	The metric. By default, the row grain of the dataset it aggregates
+Time grain	Not used here. With orders.order_date:month, one bucket per month.	:day … :year on a time dimension
+Query grain	One region.	group_by, or --from for detail rows
+In an ordinary query, the calculation grain is the row grain and the query grain is the group-by, and you never think about either. The rest of this page is about what happens when they differ.
+
+The rule: aggregate from fine to coarse¶
+Data can always be aggregated from a fine grain to a coarser one: each fine row lands in exactly one coarse group, so nothing is counted twice. Go the other way, looking at a coarse value at a finer grain, and the join copies it onto several rows; sum those rows and it is counted several times. That is fan-out.
+
+A join in the many-to-one direction is safe. An order has exactly one customer, so joining orders to customers gives each order row one region. That adds a column, never a row, which is why revenue by region above is correct.
+
+A join in the other direction fans out. customers.sales_target lives at the customer grain. Ask for it by order month and each customer is copied onto every one of their orders. A hand-written join returns 1,300 for January, because C1 has two January orders and its target of 500 is counted twice. Dosi refuses instead:
+
+
+dosi query --model model.yaml --metrics total_target \
+    --group-by orders.order_date:month --execute --db shop.duckdb
+error: FanOutRisk: metric "total_target" aggregates Sum over dataset "customers", which has no many→one path to ["orders"]; evaluating a duplicate-sensitive aggregate (SUM/AVG/COUNT) across that join would double-count rows
+  hint: group by dimensions reachable from the metric's dataset, or restate the metric with a duplicate-insensitive aggregate (COUNT DISTINCT/MIN/MAX)
+Grouped by customers.region, the same metric is fine (East 800, West 600): that grouping is at or above the customer grain. Semantics — fan-out protection has the exact rules.
+
+Time grain follows the same rule. Daily rows roll up into months. A column stored monthly, such as a month-end snapshot, cannot be split back into days, so asking for :day on a column whose declared native grain is month is a grain_too_fine error.
+
+Two facts in one answer: align, don't join rows¶
+orders and visits are both facts, and neither belongs to the other: a visit is not part of an order. Join their rows directly and every order is copied onto every visit by the same customer. On this data that reports nine orders and nine visits in January, a conversion of 1.0. There were three orders and five visits.
+
+Dosi aggregates first, then joins the results. Each fact is aggregated on its own up to the query grain (one row per month, say), and the two results are then joined on the columns they share. So there is still a join, but it joins one aggregated row to one aggregated row, and nothing fans out. When both facts reach a shared dimension table, that needs no extra declaration:
+
+
+dosi query --model model.yaml --metrics order_count,visit_count \
+    --group-by customers.region --execute --db shop.duckdb
+region  order_count  visit_count
+East    3            6
+West    1            2
+2 rows
+Dates are the common case with no dimension table between them. Without a declaration, orders.order_date means nothing to visits, and a metric that needs both is refused:
+
+
+error: UnconformedDimension: dimension "orders.order_date" is not conformed for derived metric "conversion": member(s) ["visit_count"] have no many→one path to "orders"
+D-CONFORM declares that visits.visit_date and orders.order_date are the same dimension, spelled differently on each fact:
+
+
+relationships:
+  - name: visits_orders_by_date
+    from: visits
+    to: orders
+    from_columns: [visit_date]
+    to_columns: [order_date]
+    custom_extensions:
+      - vendor_name: DATUS
+        data: '{"v": "1.8", "requires": ["cardinality"], "cardinality": "many_to_many"}'
+With that pairing, each fact groups its own date, and the branches merge on the month:
+
+
+dosi query --model model.yaml --metrics order_count,visit_count,conversion \
+    --group-by orders.order_date:month --execute --db shop.duckdb
+order_date__month    order_count  visit_count  conversion
+2024-02-01 00:00:00  1            3            0.3333333333333333
+2024-01-01 00:00:00  3            5            0.6
+2 rows
+The generated SQL makes it plain: one GROUP BY per fact, then a FULL OUTER JOIN on the month. Order rows and visit rows are never joined to each other. D-CONFORM does not change any grain; it only tells Dosi which column to match the two results on once each side is aggregated.
+
+A metric at its own grain: LOD¶
+Some questions need a calculation grain that is neither the row grain nor the query grain. "Average lifetime revenue per customer, by region" is one: first total each customer's orders, then average those totals within each region. Averaging the order amounts gives East 200, an answer to a different question, because C1 counts twice.
+
+LOD (level of detail) declares a metric's calculation grain separately from the query grain. The query still only picks metrics and a group-by; the model says where the intermediate step happens. Measured against the query grain, there are three moves:
+
+Declaration	Calculation grain	Compared with the query grain	Back at the query grain	Example result
+fixed(revenue, customers.customer_id)	exactly the listed keys	independent of it	as a field: aggregate it, group by it, or filter on it	AVG of it by region: East 300, West 400
+AVG(include(order_count, orders.customer_id))	the query grain plus the keys	finer	must be aggregated back: the outer AVG	orders per buyer by month: January 1.5, February 1
+exclude(revenue, orders.order_date)	the query grain minus the keys	coarser	copied onto each row	by customer and date, C1's two rows both read 400
+The rule from above decides each "back at the query grain" column:
+
+include computes at a finer grain, so its values cannot come back without being combined. Dosi requires the outer aggregate that says how.
+exclude computes at a coarser grain, so each query row reads exactly one value, and copying it is safe.
+fixed has a grain of its own that does not follow the query. As a metric, the group-by must include all of its keys, without a time grain such as :day. Other dimensions may be added, and the same fixed value then repeats on each of their rows. Dosi will not roll it up to a coarser grain for you. As a field it becomes an attribute of its entity, one value per customer, which ordinary metrics can then aggregate, group or filter by.
+LOD also changes which records a calculation reads: a fixed calculation ignores ordinary display filters. That is a scope question, not a grain question; Filters decide which records enter the calculation covers it.
+
+LOD and alignment together¶
+The two mechanisms compose. Each fact can define its own fixed field, for example a buyer classification on orders and another on visits, and a D-CONFORM pairing between those fields makes them one dimension. Each fact then computes its classification and its metrics alone, and the grouped results align, exactly as dates did above.
+
+What does not work is a fixed field on one fact that directly aggregates the other, grouped together with both facts' metrics: that is a row-to-row path between two facts again, and it is refused as fan_out_risk. LOD across datasets has the full rules.
+
+Reading grain errors¶
+Most planning errors that are not typos are a grain mismatch. The code tells you which grain:
+
+Code	The mismatch	What to change
+fan_out_risk	a metric would be copied onto finer rows than its row grain	group by something its dataset reaches many-to-one, or use COUNT DISTINCT / MIN / MAX
+unconformed_dimension	two facts have no shared column at the requested grain	group by a shared dimension, or pair the columns with D-CONFORM
+grain_too_fine	a time grain finer than the column stores	use the stored grain or coarser
+grain_on_non_time_dimension	a time grain on a field that is not a time dimension	drop the :grain, or mark the field as time
+lod_dimension_not_grouped	an LOD metric's keys are missing from the query grain	add the keys to group_by
+time_axis_not_grouped, window_reset_too_fine	a window's time axis is missing from, or finer than, the query grain	group by the axis at the window's grain
+Every one of these carries candidates or a suggested_retry. See Errors.
+
