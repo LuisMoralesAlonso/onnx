@@ -639,17 +639,189 @@ a filter derivation	only the aggregates under it
 where conditions on a selected metric — in a window query, also on group-by fields alone	the result rows
 That table is why the same condition in where and in context_filter can give a fixed metric two different values: one reaches it, the other does not.
 
-Limits¶
-No time spine: a period with no rows has no row, and nothing invents it. A shift lines periods up by calendar, so a missing previous month reads NULL.
-A window can read another window's output three levels deep; a fourth is refused.
-Computing parts apart is enabled on DuckDB, PostgreSQL, Hologres, GaussDB, DWS, MySQL, TiDB, Trino, Athena, Snowflake, BigQuery, Databricks and ClickHouse. On other dialects a query that needs it is refused.
-See also¶
-Grain: what one row means — the grains a query and a level of detail work at
-Derived metrics — filter and compose
-Window metrics — shifts, frames, ranks
-Understand and start using LOD — exclude, fixed, include
-Query metrics — the query and its response
- Back to top
-Next
-Install manually
-Copyright © Datus · Licensed under the Elastic License 2.0
+Query metrics¶
+A metric query names metrics and the dimensions to break them down by; Dosi writes the aggregation, the joins and the GROUP BY. For row-level records instead of aggregates, see Query detail rows.
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue,order_count \
+    --group-by customers.region,orders.status \
+    --order -revenue \
+    --execute --db orders.duckdb
+region  status     revenue  order_count
+east    completed  10163    12
+NULL    completed  7140.49  9
+west    completed  6522     18
+west    cancelled  10       1
+NULL    pending    0        1
+5 rows
+You never write a JOIN: revenue lives on orders, region on customers, and Dosi follows the relationship between them. The examples on this page use the bundled orders model and the orders.duckdb file loaded in the tutorial.
+
+Pick metrics and dimensions¶
+--metrics takes metric names; --group-by takes dataset.field items. Ask the model what it has before guessing:
+
+
+dosi list metrics --model $DOSI_EXAMPLES/orders/model.yaml
+dosi list dimensions --model $DOSI_EXAMPLES/orders/model.yaml
+dosi show metric revenue --model $DOSI_EXAMPLES/orders/model.yaml
+metric: revenue
+description: Total order amount
+kind: aggregate
+expr: SUM(orders.amount)
+datasets: orders
+group_by: orders, customers, products
+time: metric_time (day, week, month, quarter, year)
+group_by lists the datasets a metric can be broken down by, and time the grains it accepts. A misspelled name is refused with the names that do exist:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml --metrics revenu
+error: UnknownMetric: unknown metric "revenu"
+  candidates: revenue, order_count, unique_customers, avg_order_value, total_margin
+Time grain and metric_time¶
+Append :grain to a time dimension to bucket it at that time grain: day, week, month, quarter or year. The output column is named {field}__{grain}:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue --group-by orders.order_date:month \
+    --order order_date__month --execute --db orders.duckdb
+order_date__month    revenue
+2023-12-01 00:00:00  12
+2024-01-01 00:00:00  2059
+2024-02-01 00:00:00  1059
+2024-03-01 00:00:00  33
+2024-07-01 00:00:00  38
+2024-11-01 00:00:00  1235
+2024-12-01 00:00:00  839
+2025-01-01 00:00:00  4811.49
+2025-02-01 00:00:00  1743
+2025-03-01 00:00:00  1304
+2025-04-01 00:00:00  842
+2025-05-01 00:00:00  118
+2026-01-01 00:00:00  3101
+2026-04-01 00:00:00  1707
+2026-05-01 00:00:00  1029
+2026-07-01 00:00:00  1690
+2026-08-01 00:00:00  1205
+2026-09-01 00:00:00  1010
+18 rows
+metric_time stands for each metric's primary time dimension, so you can ask for "revenue by month" without knowing which column holds the date. The column is then metric_time__month. A metric's primary time comes from the D-TIME extension, or from its dataset's only time field.
+
+Time ranges¶
+--start-time is inclusive and --end-time exclusive, so a range is half-open [start, end). February 2024 is:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue --start-time 2024-02-01 --end-time 2024-03-01 \
+    --execute --db orders.duckdb
+revenue
+1059
+1 row
+With no time dimension in the group-by, the range applies to each metric's primary time. When the group-by holds several time dimensions, Dosi won't pick one for you:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue \
+    --group-by orders.order_date:month,customers.signup_date:month \
+    --start-time 2024-02-01 --end-time 2024-03-01
+error: TimeRangeNeedsDimension: the group-by contains 2 time dimensions; name the one the time range applies to
+  candidates: orders.order_date, customers.signup_date
+  hint: pass time_dimension (e.g. --time-dimension orders.order_date, or metric_time)
+Add --time-dimension orders.order_date and it runs.
+
+Filters¶
+--where takes SQL, and Dosi places each AND conjunct by what it reads:
+
+a condition on fields filters input rows, before aggregation;
+a condition on a selected metric filters result rows, after aggregation (the HAVING you would otherwise write).
+One exception: in a query that selects a window metric, a condition on group-by fields only also filters result rows, so the rows kept keep the ranks and partition counts the whole population gave them. To rank within the narrower set instead, put the condition in --context-filter.
+
+One --where can do both:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue,order_count --group-by customers.region \
+    --where "orders.status = 'completed' AND revenue > 100" \
+    --execute --db orders.duckdb
+region  revenue  order_count
+east    10163    12
+NULL    7140.49  9
+west    6522     18
+3 rows
+Add --pretty without --execute to see the placement: orders.status lands in the inner WHERE, revenue > 100 in a WHERE over the finished rows. A condition some part of the query cannot read is not dropped silently — it comes back as a warning (on stderr, or under warnings with --format json).
+
+--context-filter is the other filter slot: it always scopes the calculation population, including the inputs of level-of-detail fields. See LOD filters for when you need it. The full placement rules are in Semantics contract §8.
+
+Order and limit¶
+--order takes comma-separated keys; a - prefix sorts descending. A key names a metric or a group-by item — by its output column (order_date__month) or by the spelling you used in --group-by (orders.order_date:month). Anything else is refused with the keys you can use:
+
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue --order -amount
+error: UnknownOrderKey: order key "amount" is not a metric or group-by item
+  candidates: revenue
+NULLs sort last on every warehouse, ascending and descending alike; --order "-revenue nulls first" puts them first. --limit caps the rows after ordering, so --order -revenue --limit 10 is a top 10.
+
+Compile or execute¶
+Without --execute, dosi query only prints the SQL. That is the way to check a query, or to hand the SQL to another tool:
+
+Flag	Effect
+--pretty	format the SQL
+--dialect <name>	compile for another warehouse — the model doesn't change
+--explain	print the logical plan above the SQL: which joins and aggregations were chosen
+--execute	run it and print the rows
+--connection <name>	run it on a profile from your connections file (see Connect a warehouse)
+--format json	machine-readable output: sql, outputs, warnings and, when executed, rows
+
+dosi query --model $DOSI_EXAMPLES/orders/model.yaml \
+    --metrics revenue --group-by metric_time:month \
+    --start-time 2024-01-01 --end-time 2024-03-01 \
+    --dialect snowflake --pretty
+SELECT
+  DATE_TRUNC('MONTH', orders.order_date) AS metric_time__month,
+  SUM(orders.amount) AS revenue
+FROM orders AS orders
+WHERE
+  orders.order_date >= CAST('2024-01-01' AS DATE)
+  AND orders.order_date < CAST('2024-03-01' AS DATE)
+GROUP BY
+  DATE_TRUNC('MONTH', orders.order_date)
+Without --dialect, Dosi compiles for your default connection (DuckDB when there is none), so the SQL you check is the SQL --execute will run.
+
+Metrics computed apart¶
+Some metrics cannot be computed in one pass over the same rows: an include level of detail regroups its fact, a running total must not see the earlier rows an offset reads, a rank is defined inside one period. Asked for together, Dosi computes them as separate parts — each exactly as it would be alone, under the query's group-by, filters and time range — and aligns the parts on the group-by columns. A group any part has is a row of the result; a metric with no row for that group reads NULL (a bare count reads 0, a declared fill its value).
+
+The same happens across time_ranges: a metric that only reads one period at a time (a rank, a level of detail) is computed once per period, with the usual {metric}__{tag} columns. Ordering by such a metric's bare name ranks by its {metric}__weight column, the summed absolute per-period values, as a query in one pass does.
+
+--explain shows such a query as Align[keys=(…)] over its parts. These things keep a query in one pass, and refused if one pass cannot hold it:
+
+a where condition on a selected metric, which would have to filter the aligned rows;
+a where condition the parts would read differently: on a group-by field it filters the result of a window query and the input of any other, so a window part beside, say, an excluded total would read it two ways;
+params bindings;
+a dialect the shape is not enabled for yet. It is enabled on DuckDB, PostgreSQL, Hologres, GaussDB, DWS, MySQL, TiDB, Trino, Athena, Snowflake, BigQuery, Databricks and ClickHouse.
+A metric that cannot be planned on its own under the query's group-by is still refused, with its own reason.
+
+When Dosi refuses¶
+Dosi never returns a number it cannot vouch for. The refusal that matters most is fan_out_risk: the metric would be summed across a join that repeats its rows. In the bundled tpcds model, store_productivity sums a per-store value, and a store has no single date:
+
+
+dosi query --model $DOSI_EXAMPLES/tpcds/model.yaml \
+    --metrics total_sales,store_productivity --group-by date_dim.d_date:month
+error: FanOutRisk: metric "store_productivity" aggregates Sum over dataset "store", which has no many→one path to ["date_dim"]; evaluating a duplicate-sensitive aggregate (SUM/AVG/COUNT) across that join would double-count rows
+  hint: group by dimensions reachable from the metric's dataset, or restate the metric with a duplicate-insensitive aggregate (COUNT DISTINCT/MIN/MAX)
+Written by hand, that join returns a number, and it is wrong. Group by something the metric's dataset reaches, or query the two metrics separately.
+
+Every refusal carries a machine-readable code, the names involved, candidates where a name was wrong, and a suggested_retry — run with --format json to get them as JSON. The common ones:
+
+Code	Means
+unknown_metric, unknown_dimension, unknown_field	a name the model doesn't define; candidates lists the ones it does
+unknown_order_key	the order key is not a metric or group-by item
+time_range_needs_dimension	several time dimensions in scope; pass --time-dimension
+fan_out_risk	the result would double-count; regroup or split the query
+The full list is in Errors.
+
+Beyond the CLI¶
+The same metric query — same fields, same semantics, same errors — runs on every surface:
+
+REST API: POST /v1/query/compile, /v1/query/explain, /v1/query/execute
+MCP server: tools compile_sql, explain_query, run_query
+Python: Engine.compile() and Engine.execute() in the dosi-engine wheel
