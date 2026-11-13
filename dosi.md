@@ -805,3 +805,222 @@ Limits¶
 No time spine: a period with no rows has no row, and nothing invents it. A shift lines periods up by calendar, so a missing previous month reads NULL.
 A window can read another window's output three levels deep; a fourth is refused.
 Computing parts apart is enabled on DuckDB, PostgreSQL, Hologres, GaussDB, DWS, MySQL, TiDB, Trino, Athena, Snowflake, BigQuery, Databricks and ClickHouse. On other dialects a query that needs it is refused.
+
+Skip to content
+Dosi
+How metrics compose
+
+
+
+ 
+Dosi
+Home
+Get started
+Get started
+Quickstart
+What is Apache Ossie & Why Dosi
+Grain: what one row means
+How metrics compose
+Table of contents
+The example
+A metric is a function of the query
+The building blocks
+The order of blocks
+What is still refused
+Where a condition applies
+Limits
+See also
+Install manually
+Tutorial: the dosi CLI
+Guides
+Guides
+Dosi in agents
+Dosi in agents
+The Dosi plugin
+The Dosi plugin
+The Dosi plugin
+Claude Code
+Codex
+DeepSeek Harness
+Other agents
+Run the MCP server yourself
+Connect a warehouse
+Connect a warehouse
+DuckDB
+SQLite
+MySQL
+TiDB
+StarRocks
+Doris
+PostgreSQL
+Oracle
+SAP HANA
+ClickHouse
+Trino
+Amazon Athena
+Snowflake
+Redshift
+BigQuery
+Databricks
+Query metrics
+Query detail rows
+Metric attribution
+Metric lineage
+Ontologies
+Fast result transfer (Arrow)
+Extensions
+Extensions
+Overview
+Window metrics
+LOD
+LOD
+Understand and start using LOD
+Commerce modeling walkthrough
+Authoring reference
+Parameterized metrics
+Derived metrics
+Cross-fact alignment
+Time storage format
+Versions & compatibility
+Reference
+Reference
+CLI
+SQL policy providers
+REST API
+MCP server
+Errors
+Python API
+Semantics contract
+Benchmarks
+Release notes
+How metrics compose¶
+A metric in Dosi is not a number and not a SQL fragment. It is a function of the query: give it a group-by, a time range and some conditions, and it returns one value per group. Derived metrics are built from other metrics with a small set of building blocks, and each block takes any metric as its input — a filter over a ratio, a window over a sum of two facts, a share beside a running total. When a combination cannot be computed correctly, Dosi refuses it with an error code instead of returning a wrong number.
+
+This page shows the building blocks on a small example, the order they apply in, where each kind of condition applies, and what is still refused.
+
+The example¶
+Two tables. Every result below was run against them.
+
+customers	region
+C1	East
+C2	East
+C3	West
+orders	customer	order_date	amount	is_new
+O1	C1	2024-01-05	100	true
+O2	C1	2024-01-20	300	false
+O3	C2	2024-01-12	200	true
+O4	C3	2024-02-03	400	true
+O5	C2	2024-02-15	150	false
+O6	C3	2024-02-20	250	false
+revenue is SUM(orders.amount) and order_count is COUNT(orders.order_id); the other metrics are declared from these two below.
+
+A metric is a function of the query¶
+The model declares revenue once. Each query supplies the arguments:
+
+
+dosi query --model model.yaml --metrics revenue \
+    --group-by customers.region --execute --db shop.duckdb
+region  revenue
+East    750
+West    650
+2 rows
+
+dosi query --model model.yaml --metrics revenue \
+    --group-by metric_time:month --where "customers.region = 'East'" \
+    --order metric_time__month --execute --db shop.duckdb
+metric_time__month   revenue
+2024-01-01 00:00:00  600
+2024-02-01 00:00:00  150
+2 rows
+Same metric, two queries, two results. What a query passes in is its context: the group-by, the time range, and the conditions, kept apart by where they came from because the building blocks read them differently (see Where a condition applies).
+
+The building blocks¶
+Block	What it does to the query it is evaluated under	How a model writes it
+Aggregate	Reads the rows the query selects and aggregates them per group	the metric's expression, SUM(orders.amount)
+Filter	Adds a condition the aggregates apply to their input; no group disappears	derive: filter
+Arithmetic	Evaluates every input under the same query and combines them group by group	derive: compose, a ratio
+Shift	Moves the query's time range, then lines the result up with the current period	window offset, pop
+Window	Runs over the result rows: running totals, moving averages, ranks	window frame, rank, value
+Exclude	Evaluates its input with some group-by dimensions removed, and attaches the coarser value to each row	exclude(...)
+Fixed	Evaluates its input at exactly the dimensions it names, before where	fixed(...)
+Include	Evaluates its input at a finer grain, then aggregates back	avg(include(...))
+Any block can sit on any metric. A filter over a ratio is the ratio's two aggregates, each filtered:
+
+
+dosi query --model model.yaml --metrics aov,new_aov \
+    --group-by customers.region --execute --db shop.duckdb
+region  aov    new_aov
+East    187.5  150
+West    325    400
+2 rows
+aov is the compose revenue / order_count, and new_aov is a filter over aov with orders.is_new. East's new orders are O1 and O3, (100 + 200) / 2.
+
+A share is arithmetic over a metric and its excluded total:
+
+
+dosi query --model model.yaml --metrics revenue,revenue_total,revenue_share \
+    --group-by customers.region --execute --db shop.duckdb
+region  revenue  revenue_total  revenue_share
+East    750      1400           0.5357142857142857
+West    650      1400           0.4642857142857143
+2 rows
+Blocks that cannot share one pass over the rows still share one query. A month-over-month change and a running total are windows over the monthly rows; an average per customer regroups the orders by customer first. Asked for together, Dosi computes them as separate parts and lines the parts up on the group-by:
+
+
+dosi query --model model.yaml \
+    --metrics revenue,revenue_mom,running_revenue,revenue_per_customer \
+    --group-by metric_time:month --order metric_time__month \
+    --execute --db shop.duckdb
+metric_time__month   revenue  revenue_mom  running_revenue  revenue_per_customer
+2024-01-01 00:00:00  600      NULL         600              300
+2024-02-01 00:00:00  800      200          1400             400
+2 rows
+January has no previous month, so revenue_mom is NULL there, not 0.
+
+The order of blocks¶
+Some blocks commute, so their order does not matter:
+
+A filter commutes with every other block. A filter over a compose is the compose of the filtered members, and two filters are one condition.
+Excluding a, then b, is excluding both.
+Others do not, and Dosi keeps them in the order the model wrote:
+
+Two one-month shifts are not one two-month shift at a daily grain: 31 March 2024 less a month is 29 February, and less another month is 29 January, where two months back is 31 January.
+A window over a ratio is not the ratio of two windows: the running sum of a ratio is not the running sum of its numerator over the running sum of its denominator.
+What is still refused¶
+A few combinations need a block to read its input's result rows before it can start, and Dosi does not compute those yet:
+
+a window whose base is a level-of-detail metric;
+a level of detail whose base is a window;
+a filter over either.
+They are refused when the model is validated, never computed wrong:
+
+
+dosi validate --model model.yaml
+✗ NotImplemented in metric 'running_revenue_per_customer': window.base "revenue_per_customer" is a level-of-detail metric; a window over a level of detail is not implemented
+  hint: see docs/datus-extensions.md#d-lod-view-relative
+The window and level-of-detail references list the rest.
+
+Where a condition applies¶
+A query's conditions are kept apart by where they came from, because the building blocks read them differently:
+
+Condition	Read by
+context_filter	every aggregate, before any level of detail — fixed included
+where conditions on rows	every aggregate except a fixed one
+a filter derivation	only the aggregates under it
+where conditions on a selected metric — in a window query, also on group-by fields alone	the result rows
+That table is why the same condition in where and in context_filter can give a fixed metric two different values: one reaches it, the other does not.
+
+Limits¶
+No time spine: a period with no rows has no row, and nothing invents it. A shift lines periods up by calendar, so a missing previous month reads NULL.
+A window can read another window's output three levels deep; a fourth is refused.
+Computing parts apart is enabled on DuckDB, PostgreSQL, Hologres, GaussDB, DWS, MySQL, TiDB, Trino, Athena, Snowflake, BigQuery, Databricks and ClickHouse. On other dialects a query that needs it is refused.
+See also¶
+Grain: what one row means — the grains a query and a level of detail work at
+Derived metrics — filter and compose
+Window metrics — shifts, frames, ranks
+Understand and start using LOD — exclude, fixed, include
+Query metrics — the query and its response
+ Back to top
+Next
+Install manually
+Copyright © Datus · Licensed under the Elastic License 2.0
